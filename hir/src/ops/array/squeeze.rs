@@ -5,7 +5,7 @@ use super::RmDims;
 
 #[derive(Debug, Clone, new, Default, Hash)]
 pub struct Squeeze {
-    axes: Option<Vec<isize>>,
+    pub axes: Option<Vec<isize>>,
 }
 
 
