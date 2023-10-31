@@ -6,7 +6,7 @@ use tract_hir::ops;
 use tract_hir::ops::binary::Nary;
 
 mod clip;
-mod gemm;
+pub mod gemm;
 mod mat_mul_integer;
 mod pow;
 mod rem;
