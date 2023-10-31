@@ -17,10 +17,10 @@ pub fn gemm(
 
 #[derive(Debug, Clone, new)]
 pub struct Gemm {
-    alpha: f32,
-    beta: f32,
-    trans_a: bool,
-    trans_b: bool,
+    pub alpha: f32,
+    pub beta: f32,
+    pub trans_a: bool,
+    pub trans_b: bool,
 }
 
 impl Expansion for Gemm {
