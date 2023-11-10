@@ -20,7 +20,7 @@ for path in $ALL_CRATES_PATH
 do
     crate=$(tomato get package.name $path/Cargo.toml)
     tomato set package.version $VERSION $path/Cargo.toml > /dev/null
-    for other_cargo_toml in `find . -name Cargo.toml`
+    for other_cargo_toml in `find . -name Cargo.toml \!  -path "./target/*" \! -path "./issue*"`
     do
         if tomato get dependencies.$crate $other_cargo_toml | grep -F . > /dev/null
         then

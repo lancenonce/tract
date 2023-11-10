@@ -1,24 +1,20 @@
-use std::alloc::*;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use tract_data::anyhow;
+
+use tract_data::TractResult;
 
 use crate::LADatum;
 
-macro_rules! ew_impl {
-    ($ti: ident, $func: ident, $nr: expr, $alignment_items: expr) => {
-        paste! {
-            mod [<sys_ $func>] {
-                #[allow(unused_imports)]
-                use tract_data::prelude::f16;
-                extern_kernel!(fn $func(ptr: *mut $ti, count: usize) -> ());
-            }
+use super::element_wise_helper::run_over_slice_with_alignment;
 
+macro_rules! ew_impl_wrap {
+    ($ti: ident, $func: ident, $nr: expr, $alignment_items: expr, $params: ty, $run: item) => {
+        paste! {
             #[derive(Copy, Clone, Debug)]
             #[allow(non_camel_case_types)]
             pub struct $func;
 
-            impl ElementWiseKer<$ti> for $func {
+            impl crate::frame::element_wise::ElementWiseKer<$ti, $params> for $func {
                 #[inline(always)]
                 fn name() -> &'static str {
                     stringify!($func)
@@ -35,122 +31,97 @@ macro_rules! ew_impl {
                 fn alignment_bytes() -> usize {
                     $alignment_items * std::mem::size_of::<$ti>()
                 }
-                #[inline(never)]
-                fn run(buf: &mut [$ti]) {
-                    unsafe { [<sys_ $func>]::$func(buf.as_mut_ptr(), buf.len()) }
-                }
+                $run
             }
         }
     };
 }
 
-struct TempBuffer {
-    layout: Layout,
-    buffer: *mut u8,
-}
-
-impl Default for TempBuffer {
-    fn default() -> Self {
-        TempBuffer { layout: Layout::new::<()>(), buffer: std::ptr::null_mut() }
-    }
-}
-
-impl TempBuffer {
-    fn ensure(&mut self, size: usize, alignment: usize) {
-        unsafe {
-            if size > self.layout.size() || alignment > self.layout.align() {
-                let size = size.max(self.layout.size());
-                let alignment = alignment.max(self.layout.align());
-                if !self.buffer.is_null() {
-                    std::alloc::dealloc(self.buffer, self.layout);
+macro_rules! ew_impl {
+    ($ti: ident, $func: ident, $nr: expr, $alignment_items: expr) => {
+        paste! {
+            mod [<sys_ $func>] {
+                #[allow(unused_imports)]
+                use tract_data::prelude::f16;
+                extern_kernel!(fn $func(ptr: *mut $ti, count: usize) -> ());
+            }
+            ew_impl_wrap!($ti, $func, $nr, $alignment_items, (),
+                #[inline(never)]
+                fn run(buf: &mut [$ti], _params: ()) {
+                    unsafe { [<sys_ $func>]::$func(buf.as_mut_ptr(), buf.len()) }
                 }
-                self.layout = Layout::from_size_align_unchecked(size, alignment);
-                self.buffer = std::alloc::alloc(self.layout);
-                assert!(!self.buffer.is_null());
-            }
+            );
         }
-    }
-}
-
-impl Drop for TempBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.buffer.is_null() {
-                std::alloc::dealloc(self.buffer, self.layout);
+    };
+    ($ti: ident, $func: ident, $nr: expr, $alignment_items: expr, $params: ty) => {
+        paste! {
+            mod [<sys_ $func>] {
+                #[allow(unused_imports)]
+                use tract_data::prelude::f16;
+                extern_kernel!(fn $func(ptr: *mut $ti, count: usize, params: $params) -> ());
             }
+            ew_impl_wrap!($ti, $func, $nr, $alignment_items, $params,
+                #[inline(never)]
+                fn run(buf: &mut [$ti], params: $params) {
+                    unsafe { [<sys_ $func>]::$func(buf.as_mut_ptr(), buf.len(), params) }
+                }
+            );
         }
-    }
+    };
 }
 
-std::thread_local! {
-    static TMP: std::cell::RefCell<TempBuffer> = std::cell::RefCell::new(TempBuffer::default());
-}
-
-pub trait ElementWise<T>: Send + Sync + Debug + dyn_clone::DynClone
+pub trait ElementWise<T, Params = ()>: Send + Sync + Debug + dyn_clone::DynClone
 where
+    Params: Copy + Send + Sync + Debug + 'static + Default,
     T: Copy + Debug + PartialEq + Send + Sync,
 {
-    fn run(&self, vec: &mut [T]) -> anyhow::Result<()>;
+    fn run(&self, vec: &mut [T]) -> TractResult<()> {
+        self.run_with_params(vec, Params::default())
+    }
+    fn run_with_params(&self, vec: &mut [T], params: Params) -> TractResult<()>;
 }
 
-dyn_clone::clone_trait_object!(<T> ElementWise<T> where T: Copy);
+dyn_clone::clone_trait_object!(<T, Params> ElementWise<T, Params> where T: Copy, Params: Copy);
 
 #[derive(Debug, Clone, new)]
-pub struct ElementWiseImpl<K, T>
+pub struct ElementWiseImpl<K, T, Params = ()>
 where
     T: LADatum,
-    K: ElementWiseKer<T> + Clone,
+    Params: Copy + Send + Sync + Debug + 'static + Default,
+    K: ElementWiseKer<T, Params> + Clone,
 {
-    phantom: PhantomData<(K, T)>,
+    phantom: PhantomData<(K, T, Params)>,
 }
 
-impl<K, T> ElementWise<T> for ElementWiseImpl<K, T>
+impl<K, T, Params> ElementWise<T, Params> for ElementWiseImpl<K, T, Params>
 where
     T: LADatum,
-    K: ElementWiseKer<T> + Clone,
+    Params: Copy + Send + Sync + Debug + 'static + Default,
+    K: ElementWiseKer<T, Params> + Clone,
 {
-    fn run(&self, vec: &mut [T]) -> anyhow::Result<()> {
-        if vec.is_empty() {
-            return Ok(());
-        }
-        unsafe {
-            TMP.with(|buffer| {
-                let mut buffer = buffer.borrow_mut();
-                buffer.ensure(K::nr() * T::datum_type().size_of(), K::alignment_bytes());
-                let tmp = std::slice::from_raw_parts_mut(buffer.buffer as *mut T, K::nr());
-                let mut compute_via_temp_buffer = |slice: &mut [T]| {
-                    tmp[..slice.len()].copy_from_slice(slice);
-                    K::run(tmp);
-                    slice.copy_from_slice(&tmp[..slice.len()])
-                };
-                let prefix_len = vec.as_ptr().align_offset(K::alignment_bytes()).min(vec.len());
-                if prefix_len > 0 {
-                    compute_via_temp_buffer(&mut vec[..prefix_len]);
-                }
-                let aligned_len = (vec.len() - prefix_len) / K::nr() * K::nr();
-                if aligned_len > 0 {
-                    K::run(&mut vec[prefix_len..][..aligned_len]);
-                }
-                if prefix_len + aligned_len < vec.len() {
-                    compute_via_temp_buffer(&mut vec[prefix_len + aligned_len..]);
-                }
-            })
-        }
-        Ok(())
+    fn run_with_params(&self, vec: &mut [T], params: Params) -> TractResult<()> {
+        run_over_slice_with_alignment(
+            vec,
+            |data| K::run(data, params),
+            K::nr(),
+            K::alignment_bytes(),
+        )
     }
 }
 
-pub trait ElementWiseKer<T>: Send + Sync + Debug + dyn_clone::DynClone + Clone + 'static
+pub trait ElementWiseKer<T, Params = ()>:
+    Send + Sync + Debug + dyn_clone::DynClone + Clone + 'static
 where
+    Params: Copy + Send + Sync + Debug + 'static + Default,
     T: LADatum,
 {
     fn name() -> &'static str;
     fn alignment_bytes() -> usize;
     fn alignment_items() -> usize;
     fn nr() -> usize;
-    fn run(vec: &mut [T]);
-    fn ew() -> Box<dyn ElementWise<T>> {
-        Box::new(ElementWiseImpl::<Self, T>::new())
+    fn run(vec: &mut [T], params: Params);
+    fn ew() -> Box<dyn ElementWise<T, Params>> {
+        Box::new(ElementWiseImpl::<Self, T, Params>::new())
     }
 }
 
@@ -160,18 +131,35 @@ pub mod test {
     use proptest::test_runner::{TestCaseError, TestCaseResult};
     use tract_data::internal::*;
 
-    pub fn test_element_wise<K: ElementWiseKer<T>, T: LADatum, F: Fn(T) -> T>(
+    pub fn test_element_wise<K: ElementWiseKer<T, ()>, T: LADatum, F: Fn(T) -> T>(
         values: &[T],
         reference: F,
     ) -> TestCaseResult {
-        let op = ElementWiseImpl::<K, T>::new();
+        test_element_wise_params::<K, T, F, ()>(values, reference, ())
+    }
+
+    pub fn test_element_wise_params<
+        K: ElementWiseKer<T, Params>,
+        T: LADatum,
+        F: Fn(T) -> T,
+        Params,
+    >(
+        values: &[T],
+        reference: F,
+        params: Params,
+    ) -> TestCaseResult
+    where
+        Params: Copy + Send + Sync + Debug + 'static + Default,
+    {
+        crate::setup_test_logger();
+        let op = ElementWiseImpl::<K, T, Params>::new();
         let mut values = values.to_vec();
         while values.len() < K::nr() {
             values.push(T::zero());
         }
         let expected = values.iter().copied().map(reference).collect::<Vec<_>>();
         let mut found = values;
-        op.run(&mut found).unwrap();
+        op.run_with_params(&mut found, params).unwrap();
         tensor1(&found)
             .close_enough(&tensor1(&expected), true)
             .map_err(|e| TestCaseError::fail(e.root_cause().to_string()))?;

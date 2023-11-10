@@ -43,6 +43,7 @@ pub enum FusedSpec<'t> {
     BinPerCol(TensorView<'t>, BinOp),
     AddRowColProducts(&'t Tensor, &'t Tensor),
     AddUnicast(OutputStore),
+    LeakyRelu(&'t Tensor),
     QScale(isize, RoundingPolicy, i32),
     RoundingShiftRight(usize, RoundingPolicy),
     ShiftLeft(usize),
@@ -77,6 +78,8 @@ pub enum FusedKerSpec<TI: Copy> {
     ScalarMul(TI),                              // jump_to:scalar_mul
     ScalarSub(TI),                              // jump_to:scalar_sub
     ScalarSubF(TI),                             // jump_to:scalar_sub_flipped
+
+    LeakyRelu(TI),                              // jump_to:leaky_relu
 
     PerRowMin(*const TI),                       // jump_to:per_row_min
     PerRowMax(*const TI),                       // jump_to:per_row_max
@@ -131,12 +134,15 @@ pub mod test {
         ($cond:expr, $ker:ident, $tc:ty, $ti: ty) => {
             mod fuse {
                 use super::super::$ker;
+                use num_traits::Zero;
                 #[allow(unused_imports)]
                 use tract_data::prelude::f16;
                 #[allow(unused_imports)]
                 use $crate::frame::mmm::fuse::test;
                 use $crate::frame::mmm::fuse::test::tile;
+                use $crate::frame::mmm::{ FusedSpec, MatMatMulKer };
                 use $crate::frame::mmm::fuse::FusedKerSpec;
+                use tract_data::prelude::tensor0;
 
                 #[test]
                 fn return_zeros() {
@@ -178,11 +184,11 @@ pub mod test {
                 }
 
                 macro_rules! bin {
-                    ($FKS:ident, $geo:expr, $f:expr) => {
+                    ($FKS:ident, $geo:expr, $f:expr, $extra_cond:expr) => {
                         paste! {
                             #[test]
                             fn [<$FKS:snake>]() {
-                                if $cond {
+                                if $cond && $extra_cond {
                                     test::$geo::<$ker, $tc, $ti>(FusedKerSpec::$FKS, $f);
                                 }
                             }
@@ -190,26 +196,30 @@ pub mod test {
                     };
                 }
 
-                bin!(PerColMin,  per_col, fmin);
-                bin!(PerColMax,  per_col, fmax);
-                bin!(PerColAdd,  per_col, |a,b| a+b);
-                bin!(PerColMul,  per_col, |a,b| a*b);
-                bin!(PerColSub,  per_col, |a,b| a-b);
-                bin!(PerColSubF, per_col,  |a,b| b-a);
+                bin!(PerColMin, per_col, fmin, true);
+                bin!(PerColMax, per_col, fmax, true);
+                bin!(PerColAdd, per_col, |a, b| a + b, true);
+                bin!(PerColMul, per_col, |a, b| a * b, true);
+                bin!(PerColSub, per_col, |a, b| a - b, true);
+                bin!(PerColSubF, per_col, |a, b| b - a, true);
 
-                bin!(PerRowMin,  per_row, fmin);
-                bin!(PerRowMax,  per_row, fmax);
-                bin!(PerRowAdd,  per_row, |a,b| a+b);
-                bin!(PerRowMul,  per_row, |a,b| a*b);
-                bin!(PerRowSub,  per_row, |a,b| a-b);
-                bin!(PerRowSubF, per_row,  |a,b| b-a);
+                bin!(PerRowMin, per_row, fmin, true);
+                bin!(PerRowMax, per_row, fmax, true);
+                bin!(PerRowAdd, per_row, |a, b| a + b, true);
+                bin!(PerRowMul, per_row, |a, b| a * b, true);
+                bin!(PerRowSub, per_row, |a, b| a - b, true);
+                bin!(PerRowSubF, per_row, |a, b| b - a, true);
 
-                bin!(ScalarMin,  scalar, fmin);
-                bin!(ScalarMax,  scalar, fmax);
-                bin!(ScalarAdd,  scalar, |a,b| a+b);
-                bin!(ScalarMul,  scalar, |a,b| a*b);
-                bin!(ScalarSub,  scalar, |a,b| a-b);
-                bin!(ScalarSubF, scalar,  |a,b| b-a);
+                bin!(ScalarMin, scalar, fmin, true);
+                bin!(ScalarMax, scalar, fmax, true);
+                bin!(ScalarAdd, scalar, |a, b| a + b, true);
+                bin!(ScalarMul, scalar, |a, b| a * b, true);
+                bin!(ScalarSub, scalar, |a, b| a - b, true);
+                bin!(ScalarSubF, scalar, |a, b| b - a, true);
+
+                bin!(LeakyRelu, scalar, |a, b| if b > <$ti>::zero() { b } else { a * b }, 
+                     <$ker as MatMatMulKer<$ti>>::can_fuse(&FusedSpec::LeakyRelu(&tensor0(<$ti>::zero())))
+                );
 
                 #[test]
                 fn return_c_add_row_col_product() {
@@ -483,10 +493,10 @@ pub mod test {
         K: MatMatMulKer<TI>,
         TC: LADatum + AsPrimitive<TI>,
         TI: LADatum + AsPrimitive<TC>,
-        usize: AsPrimitive<TC> + AsPrimitive<TI>,
+        isize: AsPrimitive<TC> + AsPrimitive<TI>,
     {
         let len = K::mr() * K::nr();
-        let v: Vec<TC> = (0..len).map(|f| f.as_()).collect();
+        let v: Vec<TC> = (0..len as isize).map(|f| (f - len as isize / 2).as_()).collect();
         let five: TI = 5.as_();
         fused_ops::<K, TC, TI, _>(&v, &[op(five)], |_, _, c| f(five, c))
     }

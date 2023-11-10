@@ -53,6 +53,9 @@ pub struct Ops {
     qmmm_i32: MMMImpl,
     qmmv_i32: MMVImpl,
 
+    pub leaky_relu_f16: Box<dyn Fn() -> Box<dyn element_wise::ElementWise<f16, f16>> + Send + Sync>,
+    pub leaky_relu_f32: Box<dyn Fn() -> Box<dyn element_wise::ElementWise<f32, f32>> + Send + Sync>,
+
     pub sigmoid_f16: Box<dyn Fn() -> Box<dyn element_wise::ElementWise<f16>> + Send + Sync>,
     pub sigmoid_f32: Box<dyn Fn() -> Box<dyn element_wise::ElementWise<f32>> + Send + Sync>,
     pub tanh_f16: Box<dyn Fn() -> Box<dyn element_wise::ElementWise<f16>> + Send + Sync>,
@@ -108,12 +111,17 @@ pub fn generic() -> Ops {
         mmv_f16: Box::new(|_, _| generic::GenericMmm4x1::<f16, f16, f16>::mmm()),
         qmmm_i32: Box::new(|_, _, _| generic::GenericMmm4x4::<i8, i8, i32>::mmm()),
         qmmv_i32: Box::new(|_, _| generic::GenericMmm4x1::<i8, i8, i32>::mmm()),
+        leaky_relu_f16: Box::new(|| generic::HLeakyRelu8::ew()),
+        leaky_relu_f32: Box::new(|| generic::SLeakyRelu4::ew()),
         sigmoid_f16: Box::new(|| generic::HSigmoid8::ew()),
         sigmoid_f32: Box::new(|| generic::SSigmoid4::ew()),
         tanh_f16: Box::new(|| generic::HTanh8::ew()),
         tanh_f32: Box::new(|| generic::STanh4::ew()),
         erf_f32: Box::new(|| generic::SErf4::ew()),
         lut_u8: Box::new(|table: &[u8]| Box::new(lut::LutImpl::<generic::GenericLut8>::new(table))),
+        /*
+        activation_f32: Box::new(|microcode| generic::SActivation::new(microcode))
+        */
     }
 }
 
@@ -207,4 +215,10 @@ impl LADatum for i32 {
     fn strat() -> BoxedStrategy<Self> {
         any::<i32>().boxed()
     }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn setup_test_logger() {
+    let _ = env_logger::Builder::from_env("TRACT_LOG").try_init();
 }

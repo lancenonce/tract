@@ -3,8 +3,6 @@ use crate::internal::*;
 #[derive(Debug, Clone, new, Hash)]
 pub struct Const(pub Arc<Tensor>);
 
-
-
 impl Op for Const {
     fn name(&self) -> Cow<str> {
         "Const".into()
@@ -27,7 +25,7 @@ impl TypedOp for Const {
     as_op!();
 
     fn output_facts(&self, _inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        Ok(tvec!(self.0.as_ref().into()))
+        Ok(tvec!(Arc::clone(&self.0).into()))
     }
 
     fn change_axes(
@@ -50,6 +48,6 @@ impl TypedOp for Const {
     }
 
     fn cost(&self, _inputs: &[&TypedFact]) -> TractResult<TVec<(Cost, TDim)>> {
-        Ok(tvec!((Cost::Params(f32::datum_type()), self.0.len().into())))
+        Ok(tvec!((Cost::Params(self.0.datum_type().unquantized()), self.0.len().into())))
     }
 }

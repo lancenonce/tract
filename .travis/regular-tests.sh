@@ -25,18 +25,10 @@ if [ `uname` = "Darwin" ]
 then
     sysctl -n machdep.cpu.brand_string
     brew install coreutils
+    pip3 install numpy
 else
-    sudo apt-get install -y llvm
+    sudo apt-get install -y llvm python3 python3-numpy
 fi
-
-# if [ `uname` = "Linux" -a -z "$TRAVIS" ]
-# then
-#     apt-get update
-#     apt-get -y upgrade
-#     apt-get install -y unzip wget curl python awscli build-essential git pkg-config libssl-dev
-#     cargo --version || ( curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y )
-# fi
-
 
 if [ -z "$CACHEDIR" ]
 then
@@ -44,6 +36,14 @@ then
 fi
 
 export CACHEDIR
+
+# useful as debug_asserts will come into play
+cargo -q test -q -p tract-core --features paranoid_assertions
+cargo -q test -q -p test-onnx-core
+cargo -q test -q -p test-onnx-nnef-cycle
+
+cargo check -p tract-nnef --features complex
+cargo check -p tract --no-default-features
 
 if [ `arch` = "x86_64" -a "$RUST_VERSION" = "stable" ]
 then

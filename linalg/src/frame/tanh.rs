@@ -70,8 +70,8 @@ pub mod test {
 
             #[test]
             fn tanh_asymptots() {
-                use $crate::frame::element_wise::*;
                 use tract_data::internal::*;
+                use $crate::frame::element_wise::*;
                 if $cond {
                     let mut input: Vec<$t> = [-100f32, 100f32]
                         .iter()
@@ -95,6 +95,7 @@ pub mod test {
         f32: AsPrimitive<T>,
         T: AsPrimitive<f32>,
     {
+        crate::setup_test_logger();
         let values: Vec<T> = values.iter().copied().map(|x| x.as_()).collect();
         crate::frame::element_wise::test::test_element_wise::<K, _, _>(&values, |x| x.tanh())
     }

@@ -8,7 +8,7 @@ macro_rules! sigmoid_impl {
                 sigmoid_frame_tests!($cond, $ti, $func);
             }
         }
-    }
+    };
 }
 
 #[cfg(test)]
@@ -33,8 +33,10 @@ pub mod test {
             #[test]
             fn sigmoid_4_magic() {
                 if $cond {
-                    $crate::frame::sigmoid::test::test_sigmoid::<$ker, $t>(&[0f32, -20.0, 20.0, 0.0])
-                        .unwrap()
+                    $crate::frame::sigmoid::test::test_sigmoid::<$ker, $t>(&[
+                        0f32, -20.0, 20.0, 0.0,
+                    ])
+                    .unwrap()
                 }
             }
 
@@ -61,8 +63,8 @@ pub mod test {
 
             #[test]
             fn sigmoid_asymptots() {
-                use $crate::frame::element_wise::*;
                 use tract_data::internal::*;
+                use $crate::frame::element_wise::*;
                 if $cond {
                     let mut input: Vec<$t> = [-100f32, 100f32]
                         .iter()
@@ -86,6 +88,7 @@ pub mod test {
         f32: AsPrimitive<T>,
         T: AsPrimitive<f32>,
     {
+        crate::setup_test_logger();
         let values: Vec<T> = values.iter().copied().map(|x| x.as_()).collect();
         crate::frame::element_wise::test::test_element_wise::<K, _, _>(&values, |x| {
             (1f32).as_() / (1f32.as_() + (-x).exp())

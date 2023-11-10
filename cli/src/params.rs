@@ -84,7 +84,7 @@ pub struct ModelBuildingError(pub Box<dyn Model>, pub Box<dyn std::error::Error 
 
 impl std::fmt::Display for ModelBuildingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&*self.1, f)
+        write!(f, "ModelBuildingError")
     }
 }
 
@@ -98,7 +98,7 @@ impl std::error::Error for ModelBuildingError {
 type PulsedModel = ();
 
 /// Structure holding the parsed parameters.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Parameters {
     pub graph: SomeGraphDef,
 
@@ -485,8 +485,9 @@ impl Parameters {
         if let Some(inputs) = matches.values_of("input") {
             for (ix, v) in inputs.enumerate() {
                 let (name, fact) = tensor::for_string(symbol_table, v)?;
+                let input_index = if name.is_some() { None } else { Some(ix) };
                 result.add(TensorValues {
-                    input_index: Some(ix),
+                    input_index,
                     output_index: None,
                     name,
                     values: fact.value.concretize().map(|t| vec![t.into_tensor().into()]),
@@ -627,7 +628,9 @@ impl Parameters {
                             $to = Some(Arc::new(it));
                         }
                         Err(e) => {
-                            if let Some(last_model) = last_model.take() {
+                            if e.is::<ModelBuildingError>() {
+                                return Err(e)?;
+                            } else if let Some(last_model) = last_model.take() {
                                 return Err(ModelBuildingError(last_model, e.into()))?;
                             } else {
                                 return Err(e)?;
@@ -656,11 +659,14 @@ impl Parameters {
 
         stage!("analyse", inference_model -> inference_model,
         |mut m:InferenceModel| -> TractResult<_> {
-            let result = m.analyse(!matches.is_present("analyse-fail-fast"));
-            match result {
-                Ok(_) => Ok(m),
-                Err(e) => Err(ModelBuildingError(Box::new(m), e.into()).into())
-            }});
+            m.analyse(!matches.is_present("analyse-fail-fast")).map_err(|e|
+                ModelBuildingError(Box::new(m.clone()), e.into())
+            )?;
+            if let Some(fail) = m.missing_type_shape()?.first() {
+                bail!(ModelBuildingError(Box::new(m.clone()), format!("{} has incomplete typing", m.node(fail.node)).into()))
+            }
+            Ok(m)
+        });
         if let Some(ext) = tf_model_extensions {
             #[cfg(feature = "tf")]
             stage!("tf-preproc", inference_model -> inference_model, |m:InferenceModel| ext.preproc(m));
@@ -682,6 +688,12 @@ impl Parameters {
             dec.optimize(&mut m)?;
             Ok(m)
         });
+        #[cfg(not(feature = "pulse"))]
+        {
+            if matches.value_of("pulse").is_some() {
+                bail!("This build of tract has pulse disabled.")
+            }
+        }
         #[cfg(feature = "pulse")]
         {
             if let Some(spec) = matches.value_of("pulse") {
