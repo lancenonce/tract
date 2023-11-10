@@ -12,6 +12,7 @@ pub extern crate tract_hir;
 
 pub mod model;
 pub mod ops;
+pub use ops::gemm;
 
 #[allow(clippy::all)]
 pub mod pb {

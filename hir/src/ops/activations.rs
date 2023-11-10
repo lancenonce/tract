@@ -43,7 +43,7 @@ macro_rules! cst {
 }
 
 #[derive(Debug, Clone, new)]
-pub struct Clip(Option<f32>, Option<f32>);
+pub struct Clip(pub Option<f32>, pub Option<f32>);
 
 activation!(Clip, |op, name: &str, model: &mut TypedModel, inputs| {
     let mut wire: TVec<OutletId> = inputs.into();
