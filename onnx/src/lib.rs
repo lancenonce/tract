@@ -30,7 +30,7 @@ pub mod prelude {
     pub use tract_onnx_opl::WithOnnx;
 }
 pub use tract_onnx_opl::WithOnnx;
-pub use ops::math::gemm;
+pub use ops::gemm;
 
 use tract_hir::prelude::*;
 
