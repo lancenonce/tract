@@ -12,6 +12,7 @@ pub extern crate tract_hir;
 
 pub mod model;
 pub mod ops;
+pub use ops::gemm;
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -30,7 +31,6 @@ pub mod prelude {
     pub use tract_onnx_opl::WithOnnx;
 }
 pub use tract_onnx_opl::WithOnnx;
-pub use ops::gemm;
 
 use tract_hir::prelude::*;
 
