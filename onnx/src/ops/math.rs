@@ -5,11 +5,11 @@ use tract_hir::internal::*;
 use tract_hir::ops;
 use tract_hir::ops::binary::Nary;
 
-mod clip;
+pub mod clip;
 pub mod gemm;
-mod mat_mul_integer;
-mod pow;
-mod rem;
+pub mod mat_mul_integer;
+pub mod pow;
+pub mod rem;
 
 pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("Add", |_, _| Ok((ops::math::Add.into_hir(), vec![])));
