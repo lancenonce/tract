@@ -6,7 +6,6 @@ use tract_hir::ops;
 use tract_hir::ops::binary::Nary;
 
 pub mod clip;
-pub mod gemm;
 pub mod mat_mul_integer;
 pub mod pow;
 pub mod rem;
@@ -66,7 +65,6 @@ pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("MatMul", |_, _| Ok((expand(ops::matmul::MatMulInference::default()), vec![])));
     reg.insert("MatMulInteger", mat_mul_integer::mat_mul_integer);
     reg.insert("QLinearMatMul", mat_mul_integer::q_linear_mat_mul);
-    reg.insert("Gemm", gemm::gemm);
 }
 
 fn isinf(

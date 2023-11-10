@@ -3,6 +3,11 @@ use crate::pb::*;
 use tract_hir::internal::*;
 use tract_hir::ops;
 use tract_hir::tract_core::ops::einsum::EinSum;
+use crate::model::OnnxOpRegister;
+
+pub fn register_all_ops(reg: &mut OnnxOpRegister) {
+    reg.insert("Gemm", gemm);
+}
 
 pub fn gemm(
     _ctx: &ParsingContext,
