@@ -19,8 +19,6 @@ pub struct SpaceToBatchUnary {
     pub pad: TVec<PaddingStrat>,
 }
 
-
-
 impl Op for SpaceToBatchUnary {
     fn name(&self) -> Cow<str> {
         "SpaceToBatchUnary".into()
@@ -75,12 +73,8 @@ impl TypedOp for SpaceToBatchUnary {
                 {
                     let op = ConvUnary {
                         pool_spec: PoolSpec {
-                            data_format: conv_op.pool_spec.data_format,
-                            padding: conv_op.pool_spec.padding.clone(), // FIXME
-                            strides: conv_op.pool_spec.strides.clone(),
-                            kernel_shape: conv_op.pool_spec.kernel_shape.clone(),
-                            output_channel_override: conv_op.pool_spec.output_channel_override,
                             dilations: Some(self.block_shape.iter().map(|&i| i as usize).collect()),
+                            ..conv_op.pool_spec.clone()
                         },
                         kernel_fmt: conv_op.kernel_fmt,
                         kernel: conv_op.kernel.clone(),
@@ -110,8 +104,6 @@ pub struct BatchToSpaceUnary {
     block_shape: Array1<i32>,
     pad: Vec<PaddingStrat>,
 }
-
-
 
 impl Op for BatchToSpaceUnary {
     fn name(&self) -> Cow<str> {

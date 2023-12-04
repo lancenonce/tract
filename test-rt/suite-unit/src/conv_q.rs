@@ -1,7 +1,6 @@
 use infra::{Test, TestSuite};
 use proptest::collection::vec;
 use proptest::prelude::*;
-// use proptest::*;
 use tract_core::internal::*;
 use tract_core::ops::cnn::KernelFormat::*;
 use tract_core::ops::cnn::{ConvUnary, KernelFormat, PaddingSpec, PoolSpec};
@@ -14,12 +13,6 @@ use tract_ndarray::*;
 
 use crate::conv_f32::ConvProblemParams;
 
-pub fn qtensor(shape: Vec<usize>) -> BoxedStrategy<ArrayD<i8>> {
-    let len = shape.iter().product::<usize>();
-    vec(any::<i8>(), len..=len)
-        .prop_map(move |vec| ArrayD::from_shape_vec(shape.clone(), vec).unwrap())
-        .boxed()
-}
 /* https://www.tensorflow.org/lite/performance/quantization_spec
 CONV_2D
 Input 0:
@@ -42,25 +35,56 @@ range      : [-128, 127]
 granularity: per-tensor
 */
 
+pub fn qtensor(shape: Vec<usize>, dt: DatumType) -> BoxedStrategy<Tensor> {
+    let len = shape.iter().product::<usize>();
+    let shape2 = shape.clone();
+    if dt.unquantized().is_signed() {
+        vec(-100..100i8, len..=len)
+            .prop_map(move |vec| ArrayD::from_shape_vec(shape.clone(), vec).unwrap().into_tensor())
+            .boxed()
+    } else {
+        vec(0..100u8, len..=len)
+            .prop_map(move |vec| ArrayD::from_shape_vec(shape2.clone(), vec).unwrap().into_tensor())
+            .boxed()
+    }
+}
+
 #[allow(clippy::arc_with_non_send_sync)]
-pub fn q_params(params: &QConvProblemParams, co: usize) -> BoxedStrategy<[Tensor; 6]> {
-    let a0 = if params.no_kernel_zero_point { Just(0i32).boxed() } else { (-10..10i32).boxed() };
-    (
-        a0,
-        -10i32..10,
-        -10i32..10,
-        prop_oneof![
-            (Just(false), (-3..3i32).prop_map(|x| vec!(x)).boxed()),
-            (Just(true), vec(-3..3i32, co..=co).boxed())
-        ],
-        -3..3i32,
-        -3..3i32,
-    )
-        .prop_map(|(a0, b0, c0, a_scale, b_scale, c_scale)| {
-            let a_scale_values = a_scale.1.iter().map(|x| 2f32.powi(*x)).collect_vec();
+pub fn q_params(
+    params: &QConvProblemParams,
+    co: usize,
+    kdt: DatumType,
+    iodt: DatumType,
+) -> BoxedStrategy<[Tensor; 6]> {
+    let params = params.clone();
+    let per_channel = if params.tflite_rules && (kdt.is_unsigned() || iodt.is_unsigned()) {
+        Just(false).boxed()
+    } else {
+        any::<bool>().boxed()
+    };
+    per_channel
+        .prop_flat_map(move |per_channel| {
+            let a0 = if params.no_kernel_zero_point {
+                Just(0i32).boxed()
+            } else if kdt.is_signed() {
+                (-10..10i32).boxed()
+            } else {
+                (0..20i32).boxed()
+            };
+            let b0 = if iodt.is_signed() { -10i32..10i32 } else { 0..20 };
+            let c0 = if iodt.is_signed() { -10i32..10i32 } else { 0..20 };
+            let a_scale = if per_channel {
+                (-3..3i32).prop_map(|x| vec![x]).boxed()
+            } else {
+                vec(-3..3i32, co..=co).boxed()
+            };
+            (Just(per_channel), a0, b0, c0, a_scale, -3..3i32, -3..3i32)
+        })
+        .prop_map(|(per_channel, a0, b0, c0, a_scale, b_scale, c_scale)| {
+            let a_scale_values = a_scale.iter().map(|x| 2f32.powi(*x)).collect_vec();
             [
                 tensor0(a0),
-                if a_scale.0 { tensor1(&a_scale_values) } else { tensor0(a_scale_values[0]) },
+                if per_channel { tensor1(&a_scale_values) } else { tensor0(a_scale_values[0]) },
                 tensor0(b0),
                 tensor0(2f32.powi(b_scale)),
                 tensor0(c0),
@@ -74,18 +98,19 @@ pub fn q_params(params: &QConvProblemParams, co: usize) -> BoxedStrategy<[Tensor
 pub struct QConvProblemParams {
     pub conv: ConvProblemParams,
     pub no_kernel_zero_point: bool,
+    pub tflite_rules: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct QConvProblem {
-    shape_in: DataShape,
-    kernel_format: KernelFormat,
-    co: usize,
-    group: usize,
-    data: ArrayD<i8>,
-    kernel: ArrayD<i8>,
-    bias: Option<ArrayD<i32>>,
-    qp: [Tensor; 6],
+    pub shape_in: DataShape,
+    pub kernel_format: KernelFormat,
+    pub co: usize,
+    pub group: usize,
+    pub kernel: Tensor,
+    pub bias: Option<Array1<i32>>,
+    pub data: Tensor,
+    pub qp: [Tensor; 6],
 }
 
 impl QConvProblem {
@@ -94,15 +119,25 @@ impl QConvProblem {
     }
 
     fn reference(&self) -> Tensor {
+        assert!(self.data.datum_type().size_of() == 1);
+        assert!(self.kernel.datum_type().size_of() == 1);
         assert_eq!(self.data.shape(), &*self.shape_in.shape);
         let n = *self.shape_in.n().unwrap_or(&1);
         let ci_per_g = self.shape_in.c() / self.group;
         let co_per_g = self.co / self.group;
-        let a0 = self.qp[0].cast_to_scalar::<i32>().unwrap();
-        let b0 = self.qp[2].cast_to_scalar::<i32>().unwrap();
-        let c0 = self.qp[4].cast_to_scalar::<i32>().unwrap();
+        let a0 = *self.qp[0].to_scalar::<i32>().unwrap();
+        let b0 = *self.qp[2].to_scalar::<i32>().unwrap();
+        let c0 = *self.qp[4].to_scalar::<i32>().unwrap();
         let b_scale = self.qp[3].cast_to_scalar::<f32>().unwrap();
         let c_scale = self.qp[5].cast_to_scalar::<f32>().unwrap();
+        let kdt = self.kernel.datum_type();
+        let idt = self.data.datum_type();
+        assert!(a0 <= kdt.unquantized().max_value().cast_to_scalar::<i32>().unwrap());
+        assert!(a0 >= kdt.unquantized().min_value().cast_to_scalar::<i32>().unwrap());
+        assert!(b0 <= idt.unquantized().max_value().cast_to_scalar::<i32>().unwrap());
+        assert!(b0 >= idt.unquantized().min_value().cast_to_scalar::<i32>().unwrap());
+        assert!(c0 <= idt.unquantized().max_value().cast_to_scalar::<i32>().unwrap());
+        assert!(c0 >= idt.unquantized().min_value().cast_to_scalar::<i32>().unwrap());
         let shape_out: TVec<usize> = izip!(self.shape_in.hw_dims(), self.geo_ker())
             .map(|(i, k)| (*i + 1).saturating_sub(*k))
             .collect();
@@ -118,6 +153,10 @@ impl QConvProblem {
             self.qp[1].as_slice::<f32>().unwrap().into()
         };
         let mut temp = ArrayD::<i32>::zeros(&*shape_out.shape);
+        let data = self.data.cast_to::<i32>().unwrap();
+        let data = data.to_array_view::<i32>().unwrap();
+        let kernel = self.kernel.cast_to::<i32>().unwrap();
+        let kernel = kernel.to_array_view::<i32>().unwrap();
         for n in 0..n {
             for g in 0..self.group {
                 for geo_out in tract_ndarray::indices(shape_out.hw_dims()) {
@@ -135,7 +174,7 @@ impl QConvProblem {
                         input_coords.insert(self.shape_in.c_axis(), 0);
                         for ci in 0..ci_per_g {
                             input_coords[self.shape_in.c_axis()] = ci + g * ci_per_g;
-                            let i = self.data[&*input_coords] as i32;
+                            let i = data[&*input_coords];
                             for co in 0..co_per_g {
                                 output_coords[shape_out.c_axis()] = co + g * co_per_g;
                                 let mut kernel_coords: TVec<usize> = geo_ker.slice().into();
@@ -153,7 +192,7 @@ impl QConvProblem {
                                         kernel_coords.push(ci + g * ci_per_g);
                                     }
                                 }
-                                let k = self.kernel[&*kernel_coords] as i32;
+                                let k = kernel[&*kernel_coords];
                                 temp[&*output_coords] += (k - a0) * (i - b0);
                             }
                         }
@@ -166,37 +205,42 @@ impl QConvProblem {
             shape[shape_out.c_axis()] = bias.len();
             temp += &bias.clone().into_shape(shape).unwrap();
         }
+        let cdt = self.output_dt();
         temp.axis_iter_mut(Axis(shape_out.c_axis())).zip(a_scale).for_each(
             |(mut view, a_scale)| {
                 view.mapv_inplace(|i| {
                     (round_ties_to_even(i as f32 / c_scale * a_scale * b_scale) as i32 + c0)
-                        .max(std::i8::MIN as i32)
-                        .min(std::i8::MAX as i32)
-                })
+                        .max(cdt.unquantized().min_value().cast_to_scalar::<i32>().unwrap())
+                        .min(cdt.unquantized().max_value().cast_to_scalar::<i32>().unwrap())
+                });
             },
         );
-        temp.into_tensor()
-            .cast_to_dt(
-                i8::datum_type().quantize(QParams::ZpScale { zero_point: c0, scale: c_scale }),
-            )
+        let mut tensor = temp
+            .into_tensor()
+            .cast_to_dt(self.data.datum_type().unquantized())
             .unwrap()
-            .into_owned()
+            .into_owned();
+        unsafe { tensor.set_datum_type(cdt) };
+        tensor
+    }
+
+    fn output_dt(&self) -> DatumType {
+        self.data.datum_type().quantize(QParams::ZpScale {
+            zero_point: self.qp[4].cast_to_scalar().unwrap(),
+            scale: *self.qp[5].to_scalar().unwrap(),
+        })
     }
 
     fn tract(&self) -> TractResult<TypedModel> {
         assert!(self.data.shape() == &*self.shape_in.shape);
         let mut model = TypedModel::default();
-        let kdt = DatumType::QI8(QParams::ZpScale {
+        let kdt = self.kernel.datum_type().quantize(QParams::ZpScale {
             zero_point: self.qp[0].cast_to_scalar()?,
             scale: *self.qp[1].to_scalar()?,
         });
-        let idt = DatumType::QI8(QParams::ZpScale {
+        let idt = self.data.datum_type().quantize(QParams::ZpScale {
             zero_point: self.qp[2].cast_to_scalar()?,
             scale: *self.qp[3].to_scalar()?,
-        });
-        let cdt = DatumType::QI8(QParams::ZpScale {
-            zero_point: self.qp[4].cast_to_scalar()?,
-            scale: *self.qp[5].to_scalar()?,
         });
         let wire = model.add_source("input", idt.fact(&self.shape_in.shape))?;
         let mut inputs = tvec!(wire);
@@ -212,13 +256,14 @@ impl QConvProblem {
                 PaddingSpec::Valid,
                 None,
                 None,
-                Some(self.co),
+                *self.shape_in.c(),
+                self.co,
             ),
             self.kernel_format,
             kernel.into_arc_tensor(),
             self.group,
             self.bias.clone().map(|a| a.into_arc_tensor()),
-            Some(cdt),
+            Some(self.output_dt()),
         );
         let wire = model.wire_node("conv", op, &inputs)?[0];
         model.set_output_outlets(&[wire])?;
@@ -237,7 +282,7 @@ impl Test for QConvProblem {
         let mut model = self.tract()?;
         model.properties.insert("tract-rt-test.id".to_string(), rctensor0(id.to_string()));
         let model = runtime.prepare(model)?;
-        let idt = DatumType::QI8(QParams::ZpScale {
+        let idt = self.data.datum_type().quantize(QParams::ZpScale {
             zero_point: self.qp[2].cast_to_scalar()?,
             scale: *self.qp[3].to_scalar()?,
         });
@@ -261,9 +306,21 @@ impl Arbitrary for QConvProblem {
             1usize..=8,
             1usize..=(if params.conv.no_group { 1 } else { 3 }),
             geo_rank.prop_flat_map(crate::shapes),
+            prop_oneof![Just(DatumType::I8), Just(DatumType::U8)],
+            prop_oneof![Just(DatumType::I8), Just(DatumType::U8)],
         )
             .prop_flat_map(
-                move |(df, kf, n, mut ci0, mut co0, group, (mut ker_shape, data_shape))| {
+                move |(
+                    df,
+                    kf,
+                    n,
+                    mut ci0,
+                    mut co0,
+                    group,
+                    (mut ker_shape, data_shape),
+                    kdt,
+                    iodt,
+                )| {
                     // FIXME in HWIO order, only regular and depthwise are supported
                     if params.conv.no_arbitrary_grouping && group > 1 {
                         ci0 = 1;
@@ -272,9 +329,9 @@ impl Arbitrary for QConvProblem {
                     if kf == KernelFormat::HWIO && group > 1 {
                         ci0 = 1;
                     }
-                    let qp = q_params(&params, co0 * group);
+                    let qp = q_params(&params, co0 * group, kdt, iodt);
                     let shape_in = df.from_n_c_hw(n, ci0 * group, data_shape).unwrap();
-                    let data_in = qtensor(shape_in.shape.iter().cloned().collect());
+                    let data_in = qtensor(shape_in.shape.iter().cloned().collect(), iodt);
                     match kf {
                         KernelFormat::HWIO => {
                             ker_shape.push(ci0 * group);
@@ -289,23 +346,34 @@ impl Arbitrary for QConvProblem {
                             ker_shape.push(ci0 * group)
                         }
                     };
-                    let kernel = qtensor(ker_shape);
+                    let kernel = qtensor(ker_shape, kdt);
                     let bias = proptest::option::of(
-                        qtensor(vec![co0 * group]).prop_map(|a| a.mapv(|v| v as i32)),
+                        qtensor(vec![co0 * group], i32::datum_type()).prop_map(|b| {
+                            arr1(b.cast_to::<i32>().unwrap().as_slice::<i32>().unwrap())
+                        }),
                     );
                     (Just((kf, shape_in, co0 * group, group)), data_in, kernel, bias, qp)
                     // FIXME
                 },
             )
             .prop_map(|((kernel_format, shape_in, co, group), data, kernel, bias, qp)| {
-                QConvProblem { shape_in, co, kernel_format, group, data, kernel, bias, qp }
+                QConvProblem {
+                    shape_in,
+                    co,
+                    kernel_format,
+                    group,
+                    data: data.into_tensor(),
+                    kernel: kernel.into_tensor(),
+                    bias,
+                    qp,
+                }
             })
             .boxed()
     }
 }
 
 fn qp_noop_i8() -> [Tensor; 6] {
-    [tensor0(0i8), tensor0(1f32), tensor0(0i8), tensor0(1f32), tensor0(0i8), tensor0(1f32)]
+    [tensor0(0i32), tensor0(1f32), tensor0(0i32), tensor0(1f32), tensor0(0i32), tensor0(1f32)]
 }
 
 pub fn suite() -> TractResult<TestSuite> {
@@ -320,8 +388,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[0i8]]).into_dyn(),
-            kernel: arr3(&[[[0i8]]]).into_dyn(),
+            data: tensor2(&[[0i8]]),
+            kernel: tensor3(&[[[0i8]]]),
             bias: None,
             qp: qp_noop_i8(),
         },
@@ -333,8 +401,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[2i8]]).into_dyn(),
-            kernel: arr3(&[[[64i8]]]).into_dyn(),
+            data: tensor2(&[[2i8]]),
+            kernel: tensor3(&[[[64i8]]]),
             bias: None,
             qp: qp_noop_i8(),
         },
@@ -346,8 +414,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[-13i8], [26]]).into_dyn(),
-            kernel: arr3(&[[[8i8, -2]]]).into_dyn(),
+            data: tensor2(&[[-13i8], [26]]),
+            kernel: tensor3(&[[[8i8, -2]]]),
             bias: None,
             qp: qp_noop_i8(),
         },
@@ -359,24 +427,24 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: HWIO,
             group: 1,
-            data: arr2(&[[0i8], [0]]).into_dyn(),
-            kernel: arr3(&[[[0i8, 0], [0, 0]]]).into_dyn(),
+            data: tensor2(&[[0i8], [0]]),
+            kernel: tensor3(&[[[0i8, 0], [0, 0]]]),
             bias: None,
             qp: qp_noop_i8(),
         },
     );
     let mut qp = qp_noop_i8();
     qp[1] = tensor1(&[1f32, 0.5]);
-    qp[2] = tensor0(-2i8);
+    qp[2] = tensor0(-2i32);
     suite.add(
-        "weird_4",
+        "scale_per_channel_0",
         QConvProblem {
             shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
             kernel_format: OIHW,
             co: 2,
             group: 1,
-            data: arr2(&[[0i8]]).into_dyn(),
-            kernel: arr3(&[[[0i8]], [[7]]]).into_dyn(),
+            data: tensor2(&[[0i8]]),
+            kernel: tensor3(&[[[0i8]], [[7]]]),
             bias: None,
             qp,
         },
@@ -389,10 +457,26 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[1]]).into_dyn(),
-            kernel: arr3(&[[[0]]]).into_dyn(),
+            data: tensor2(&[[1i8]]),
+            kernel: tensor3(&[[[0i8]]]),
             bias: None,
             qp: qp_noop_i8(),
+        },
+    );
+    let mut qp = qp_noop_i8();
+    qp[0] = tensor0(2i32);
+    qp[2] = tensor0(-3i32);
+    suite.add(
+        "a0_b0_0",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [2]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            data: tensor2(&[[0i8, 0]]),
+            kernel: tensor3(&[[[0i8]]]),
+            bias: None,
+            qp,
         },
     );
 
@@ -405,8 +489,8 @@ pub fn suite() -> TractResult<TestSuite> {
             kernel_format: OIHW,
             co: 1,
             group: 1,
-            data: arr2(&[[1i8]]).into_dyn(),
-            kernel: arr3(&[[[0i8]]]).into_dyn(),
+            data: tensor2(&[[1i8]]),
+            kernel: tensor3(&[[[0i8]]]),
             bias: None,
             qp,
         },
@@ -421,8 +505,8 @@ pub fn suite() -> TractResult<TestSuite> {
             kernel_format: OIHW,
             co: 1,
             group: 1,
-            data: arr2(&[[0i8]]).into_dyn(),
-            kernel: arr3(&[[[-1i8]]]).into_dyn(),
+            data: tensor2(&[[0i8]]),
+            kernel: tensor3(&[[[-1i8]]]),
             bias: None,
             qp,
         },
@@ -434,8 +518,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr3(&[[[0], [0]]]).into_dyn(),
-            kernel: arr4(&[[[[0]]]]).into_dyn(),
+            data: tensor3(&[[[0i8], [0]]]),
+            kernel: tensor4(&[[[[0i8]]]]),
             bias: None,
             qp: qp_noop_i8(),
         },
@@ -447,15 +531,13 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr3(&[[[0], [0]], [[0], [0]], [[0], [0]]]).into_dyn(),
-            kernel: arr3(&[[[0, 0]]]).into_dyn(),
+            data: tensor3(&[[[0i8], [0]], [[0], [0]], [[0], [0]]]),
+            kernel: tensor3(&[[[0i8, 0]]]),
             bias: None,
             qp: qp_noop_i8(),
         },
     );
     let qp = qp_noop_i8();
-    let data = ArrayD::zeros(vec![2, 1, 1]);
-    let kernel = arr3(&[[[1]]]).into_dyn();
     suite.add(
         "batch_1",
         QConvProblem {
@@ -463,8 +545,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data,
-            kernel,
+            data: Tensor::zero::<i8>(&[2, 1, 1]).unwrap(),
+            kernel: tensor3(&[[[1i8]]]),
             bias: None,
             qp,
         },
@@ -478,8 +560,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[-1]]).into_dyn(),
-            kernel: arr3(&[[[1]]]).into_dyn(),
+            data: tensor2(&[[-1i8]]),
+            kernel: tensor3(&[[[1i8]]]),
             bias: None,
             qp,
         },
@@ -493,8 +575,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[41]]).into_dyn(),
-            kernel: arr3(&[[[1]]]).into_dyn(),
+            data: tensor2(&[[41i8]]),
+            kernel: tensor3(&[[[1i8]]]),
             bias: None,
             qp,
         },
@@ -508,8 +590,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[-1]]).into_dyn(),
-            kernel: arr3(&[[[2]]]).into_dyn(),
+            data: tensor2(&[[-1i8]]),
+            kernel: tensor3(&[[[2i8]]]),
             bias: None,
             qp,
         },
@@ -524,9 +606,9 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[0i8]]).into_dyn(),
-            kernel: arr3(&[[[0i8]]]).into_dyn(),
-            bias: Some(arr1(&[35i32]).into_dyn()),
+            data: tensor2(&[[0i8]]),
+            kernel: tensor3(&[[[0i8]]]),
+            bias: Some(arr1(&[35i32])),
             qp,
         },
     );
@@ -539,8 +621,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[0i8]]).into_dyn(),
-            kernel: arr3(&[[[0i8]]]).into_dyn(),
+            data: tensor2(&[[0i8]]),
+            kernel: tensor3(&[[[0i8]]]),
             bias: None,
             qp,
         },
@@ -552,8 +634,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 2,
-            data: arr2(&[[0, 0]]).into_dyn(),
-            kernel: arr3(&[[[0]], [[0]]]).into_dyn(),
+            data: tensor2(&[[0i8, 0]]),
+            kernel: tensor3(&[[[0i8]], [[0]]]),
             bias: None,
             qp: qp_noop_i8(),
         },
@@ -567,8 +649,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 2,
-            data: arr3(&[[[0], [0]]]).into_dyn(),
-            kernel: arr3(&[[[1]], [[0]]]).into_dyn(),
+            data: tensor3(&[[[0i8], [0]]]),
+            kernel: tensor3(&[[[1i8]], [[0]]]),
             bias: None,
             qp,
         },
@@ -582,8 +664,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 2,
-            data: arr2(&[[0, 0]]).into_dyn(),
-            kernel: arr3(&[[[0]], [[1]]]).into_dyn(),
+            data: tensor2(&[[0i8, 0]]),
+            kernel: tensor3(&[[[0i8]], [[1]]]),
             bias: None,
             qp,
         },
@@ -601,9 +683,9 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[4i8]]).into_dyn(),
-            kernel: arr3(&[[[-5]]]).into_dyn(),
-            bias: Some(arr1(&[-125i32]).into_dyn()),
+            data: tensor2(&[[4i8]]),
+            kernel: tensor3(&[[[-5i8]]]),
+            bias: Some(arr1(&[-125i32])),
             qp,
         },
     );
@@ -617,8 +699,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data: arr2(&[[1i8]]).into_dyn(),
-            kernel: arr3(&[[[0i8]], [[-15]]]).into_dyn(),
+            data: tensor2(&[[1i8]]),
+            kernel: tensor3(&[[[0i8]], [[-15]]]),
             bias: None,
             qp,
         },
@@ -631,16 +713,14 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data: ArrayD::zeros(vec![1, 1, 1, 1]),
-            kernel: ArrayD::zeros(vec![2, 1, 1, 1]),
-            bias: Some(tract_ndarray::arr1(&[1, 2]).into_dyn()),
+            data: Tensor::zero::<i8>(&[1, 1, 1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1, 1]).unwrap(),
+            bias: Some(arr1(&[1, 2])),
             qp: qp_noop_i8(),
         },
     );
 
     let qp = qp_noop_i8();
-    let data = ArrayD::zeros(vec![1, 1]);
-    let kernel = ArrayD::zeros(vec![2, 1, 1]);
     suite.add(
         "bias_2",
         QConvProblem {
@@ -648,18 +728,17 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data,
-            kernel,
-            bias: Some(tract_ndarray::arr1(&[0, 1]).into_dyn()),
+            data: Tensor::zero::<i8>(&[1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1]).unwrap(),
+            bias: Some(arr1(&[0, 1])),
             qp,
         },
     );
 
     let mut qp = qp_noop_i8();
-    qp[2] = tensor0(-1);
-    let data = ArrayD::zeros(vec![2, 1]);
-    let mut kernel = ArrayD::zeros(vec![5, 1, 2]);
-    *kernel.as_slice_mut().unwrap().last_mut().unwrap() = -1;
+    qp[2] = tensor0(-1i32);
+    let mut kernel = Tensor::zero::<i8>(&[5, 1, 2]).unwrap();
+    *kernel.as_slice_mut::<i8>().unwrap().last_mut().unwrap() = -1;
     suite.add(
         "bias_3",
         QConvProblem {
@@ -667,9 +746,9 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 5,
             kernel_format: OIHW,
             group: 1,
-            data,
+            data: Tensor::zero::<i8>(&[2, 1]).unwrap(),
             kernel,
-            bias: Some(ArrayD::zeros([5].as_ref())),
+            bias: Some(Array1::zeros([5])),
             qp,
         },
     );
@@ -681,9 +760,9 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data: ArrayD::zeros(vec![1, 1, 1, 1]),
-            kernel: ArrayD::zeros(vec![2, 1, 1, 1]),
-            bias: Some(tract_ndarray::arr1(&[0, 1]).into_dyn()),
+            data: Tensor::zero::<i8>(&[1, 1, 1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1, 1]).unwrap(),
+            bias: Some(arr1(&[0, 1])),
             qp: qp_noop_i8(),
         },
     );
@@ -695,16 +774,14 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data: ArrayD::zeros(vec![1, 1, 1, 1]),
-            kernel: ArrayD::zeros(vec![1, 1, 1, 1]),
-            bias: Some(tract_ndarray::arr1(&[1]).into_dyn()),
+            data: Tensor::zero::<i8>(&[1, 1, 1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[1, 1, 1, 1]).unwrap(),
+            bias: Some(arr1(&[1])),
             qp: qp_noop_i8(),
         },
     );
 
     let qp = qp_noop_i8();
-    let data = ArrayD::zeros(vec![1, 1]);
-    let kernel = ArrayD::zeros(vec![2, 1, 1]);
     suite.add(
         "bias_in_chw",
         QConvProblem {
@@ -712,15 +789,13 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data,
-            kernel,
-            bias: Some(ArrayD::zeros([2].as_ref())),
+            data: Tensor::zero::<i8>(&[1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1]).unwrap(),
+            bias: Some(arr1(&[0, 0])),
             qp,
         },
     );
     let qp = qp_noop_i8();
-    let data = ArrayD::zeros(vec![1, 1, 1]);
-    let kernel = ArrayD::zeros(vec![1, 1, 1]);
     suite.add(
         "bias_with_batch",
         QConvProblem {
@@ -728,15 +803,13 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 1,
             kernel_format: OIHW,
             group: 1,
-            data,
-            kernel,
-            bias: Some(arr1(&[1]).into_dyn()),
+            data: Tensor::zero::<i8>(&[1, 1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[1, 1, 1]).unwrap(),
+            bias: Some(arr1(&[1])),
             qp,
         },
     );
     let qp = qp_noop_i8();
-    let data = ArrayD::zeros(vec![1, 1, 1]);
-    let kernel = ArrayD::zeros(vec![2, 1, 1]);
     suite.add(
         "bias_vec_with_batch",
         QConvProblem {
@@ -744,15 +817,13 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data,
-            kernel,
-            bias: Some(arr1(&[0, 1]).into_dyn()),
+            data: Tensor::zero::<i8>(&[1, 1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1]).unwrap(),
+            bias: Some(arr1(&[0, 1])),
             qp,
         },
     );
     let qp = qp_noop_i8();
-    let data = ArrayD::zeros(vec![1, 2]);
-    let kernel = ArrayD::zeros(vec![5, 2, 1]);
     suite.add(
         "asan_0",
         QConvProblem {
@@ -760,8 +831,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 5,
             kernel_format: OIHW,
             group: 1,
-            data,
-            kernel,
+            data: Tensor::zero::<i8>(&[1, 2]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[5, 2, 1]).unwrap(),
             bias: None,
             qp,
         },
@@ -775,8 +846,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data: ArrayD::zeros(vec![1, 1]),
-            kernel: ArrayD::zeros(vec![2, 1, 1]),
+            data: Tensor::zero::<i8>(&[1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1]).unwrap(),
             bias: None,
             qp,
         },
@@ -790,8 +861,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data: ArrayD::zeros(vec![1, 1, 2]),
-            kernel: ArrayD::zeros(vec![2, 1, 1, 2]),
+            data: Tensor::zero::<i8>(&[1, 1, 2]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1, 2]).unwrap(),
             bias: None,
             qp,
         },
@@ -805,8 +876,8 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data: ArrayD::zeros(vec![1, 1, 1]),
-            kernel: ArrayD::zeros(vec![2, 1, 1]),
+            data: Tensor::zero::<i8>(&[1, 1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 1]).unwrap(),
             bias: None,
             qp,
         },
@@ -820,9 +891,175 @@ pub fn suite() -> TractResult<TestSuite> {
             co: 2,
             kernel_format: OIHW,
             group: 1,
-            data: ArrayD::zeros(vec![1, 1, 2]),
-            kernel: ArrayD::zeros(vec![2, 1, 2]),
+            data: Tensor::zero::<i8>(&[1, 1, 2]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[2, 1, 2]).unwrap(),
             bias: None,
+            qp,
+        },
+    );
+    let qp = qp_noop_i8();
+    suite.add(
+        "i8_u8",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            data: Tensor::zero::<u8>(&[1, 1]).unwrap(),
+            kernel: Tensor::zero::<i8>(&[1, 1, 1]).unwrap(),
+            bias: None,
+            qp,
+        },
+    );
+    /*
+    let mut qp = qp_noop_i8();
+    qp[2] = tensor0(-1i32);
+    qp[5] = tensor0(0.5f32);
+    suite.add(
+    "i8_u8_0",
+    QConvProblem {
+    shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+    co: 1,
+    kernel_format: OIHW,
+    group: 1,
+    data: Tensor::zero::<u8>(&[1, 1]).unwrap(),
+    kernel: tensor3(&[[[1i8]]]),
+    bias: None,
+    qp,
+    },
+    );
+    */
+    let mut qp = qp_noop_i8();
+    qp[1] = tensor0(2f32);
+    suite.add(
+        "i8_u8_ascale",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: Tensor::zero::<i8>(&[1, 1, 1]).unwrap(),
+            bias: None,
+            data: Tensor::zero::<u8>(&[1, 1]).unwrap(),
+            qp,
+        },
+    );
+    let mut qp = qp_noop_i8();
+    qp[2] = tensor0(1i32);
+    suite.add(
+        "i8_u8_d0",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[-3i8]]]),
+            bias: None,
+            data: tensor2(&[[1u8]]),
+            qp,
+        },
+    );
+    let mut qp = qp_noop_i8();
+    qp[4] = tensor0(2i32);
+    suite.add(
+        "i8_u8_c0",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[1i8]]]),
+            bias: None,
+            data: tensor2(&[[4u8]]),
+            qp,
+        },
+    );
+    let qp = qp_noop_i8();
+    suite.add(
+        "i8_u8_sat_0",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[-1i8]]]),
+            bias: None,
+            data: tensor2(&[[1u8]]),
+            qp,
+        },
+    );
+    let mut qp = qp_noop_i8();
+    qp[2] = tensor0(1i32);
+    qp[4] = tensor0(2i32);
+    suite.add(
+        "i8_u8_weird_0",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[-1i8]]]),
+            bias: None,
+            data: tensor2(&[[0u8]]),
+            qp,
+        },
+    );
+    let mut qp = qp_noop_i8();
+    qp[1] = tensor0(2f32);
+    qp[2] = tensor0(1i32);
+    qp[3] = tensor0(4f32);
+    suite.add(
+        "i8_u8_scales_0",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[-1i8]]]),
+            bias: None,
+            data: tensor2(&[[0u8]]),
+            qp,
+        },
+    );
+    let qp = qp_noop_i8();
+    suite.add(
+        "u8_i8_0",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[0u8]]]),
+            bias: None,
+            data: tensor2(&[[0i8]]),
+            qp,
+        },
+    );
+    let qp = qp_noop_i8();
+    suite.add(
+        "u8_i8_1",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [2]).unwrap(),
+            co: 1,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[0u8, 0]]]),
+            bias: None,
+            data: tensor2(&[[-9i8, 0]]),
+            qp,
+        },
+    );
+    let qp = qp_noop_i8();
+    suite.add(
+        "u8_i8_2",
+        QConvProblem {
+            shape_in: CHW.from_n_c_hw(1, 1, [1]).unwrap(),
+            co: 2,
+            kernel_format: OIHW,
+            group: 1,
+            kernel: tensor3(&[[[0u8]], [[0]]]),
+            bias: None,
+            data: tensor2(&[[0i8]]),
             qp,
         },
     );

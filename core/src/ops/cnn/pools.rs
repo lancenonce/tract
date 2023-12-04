@@ -12,7 +12,8 @@ pub struct PoolSpec {
     pub padding: PaddingSpec,
     pub dilations: Option<TVec<usize>>,
     pub strides: Option<TVec<usize>>,
-    pub output_channel_override: Option<usize>,
+    pub input_channels: usize,
+    pub output_channels: usize,
 }
 
 impl PoolSpec {
@@ -56,11 +57,12 @@ impl PoolSpec {
 
     pub fn output_shape<D: DimLike>(&self, input: &[D]) -> TractResult<BaseDataShape<D, TVec<D>>> {
         let ishape: BaseDataShape<D, TVec<D>> = self.data_format.shape(input.into())?;
+        ensure!(ishape.c().to_dim() == self.input_channels.to_dim());
         let computed = self.computed_padding(ishape.hw_dims());
         let spatial_dims = computed.into_iter().map(|d| d.convoluted).collect::<TVec<D>>();
         let oshape = self.data_format.from_n_c_hw(
             ishape.n().cloned().unwrap_or_else(|| 1.into()),
-            self.output_channel_override.map(|i| i.into()).unwrap_or_else(|| ishape.c().clone()),
+            self.output_channels.into(),
             spatial_dims,
         )?;
         Ok(oshape)
@@ -94,12 +96,11 @@ impl PoolSpec {
         op.change_shape_array(&mut strides, false)?;
         let padding = self.padding.change_geo_axes(op)?;
         Ok(PoolSpec {
-            data_format: self.data_format,
             kernel_shape,
             padding,
             dilations: Some(dilations),
             strides: Some(strides),
-            output_channel_override: self.output_channel_override,
+            ..self.clone()
         })
     }
 }
@@ -126,9 +127,7 @@ impl super::ResolveTo<ConcretePoolGeometry> for SymbolicPoolGeometry {
         let input_shape = self.pool_spec.data_format.shape(input_full_shape.into())?;
         let output_inner_stride = match self.pool_spec.data_format {
             DataFormat::NCHW | DataFormat::CHW => 1,
-            DataFormat::NHWC | DataFormat::HWC => {
-                self.pool_spec.output_channel_override.unwrap_or(*input_shape.c())
-            }
+            DataFormat::NHWC | DataFormat::HWC => self.pool_spec.output_channels,
         };
         let mut spec = PatchSpec::for_full_shape(self.pool_spec.data_format, input_full_shape)?
             .with_output_inner_stride(output_inner_stride)
@@ -143,7 +142,7 @@ impl super::ResolveTo<ConcretePoolGeometry> for SymbolicPoolGeometry {
         let patch = spec.into_patch();
         let output_shape = input_shape.fmt.from_n_c_hw(
             *input_shape.n().unwrap_or(&1),
-            self.pool_spec.output_channel_override.unwrap_or(*input_shape.c()),
+            self.pool_spec.output_channels,
             &*patch.output_shape,
         )?;
         Ok(ConcretePoolGeometry { input_shape, patch, output_shape })

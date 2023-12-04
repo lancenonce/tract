@@ -1,6 +1,8 @@
+use infra::Test;
 use regex::Regex;
 use suite_unit::conv_f32::{ConvProblem, ConvProblemParams};
 use suite_unit::conv_q::{QConvProblem, QConvProblemParams};
+use tract_core::internal::*;
 
 pub fn suite() -> &'static infra::TestSuite {
     lazy_static::lazy_static! {
@@ -15,17 +17,19 @@ fn mk_suite() -> infra::TestSuite {
     onnx.ignore(&ignore_onnx);
     onnx.skip(&skip_onnx);
     let mut unit = suite_unit::suite().unwrap().clone();
-    unit.ignore(&ignore_unit);
+    unit.ignore_case(&ignore_unit);
     let cv =
         ConvProblemParams { no_group: true, geo_rank: Some(1..3), ..ConvProblemParams::default() };
     unit.get_sub_mut("conv_f32").add_arbitrary::<ConvProblem>("proptest", cv.clone());
-    unit.get_sub_mut("conv_q").add_arbitrary::<QConvProblem>(
+    unit.get_sub_mut("conv_q").add_arbitrary_with_filter::<QConvProblem>(
         "proptest",
         QConvProblemParams {
             conv: cv,
             no_kernel_zero_point: true,
+            tflite_rules: true,
             ..QConvProblemParams::default()
         },
+        compatible_conv_q,
     );
     infra::TestSuite::default().with("onnx", onnx).with("unit", unit)
 }
@@ -125,16 +129,46 @@ fn skip_onnx(t: &[String]) -> bool {
     excluded.split_whitespace().any(|s| s == name)
 }
 
-fn ignore_unit(t: &[String]) -> bool {
-    let [section, unit] = t else { return false };
+fn ignore_unit(t: &[String], case: &dyn Test) -> bool {
+    if let Some(cp) = case.downcast_ref::<ConvProblem>() {
+        if !compatible_conv_f32(cp) {
+            return true;
+        }
+    }
+    if let Some(qcp) = case.downcast_ref::<QConvProblem>() {
+        if !compatible_conv_q(qcp) {
+            return true;
+        }
+    }
+    let [section, _unit] = t else { return false };
     ["deconv"].contains(&&**section)
-        // grouping and depthwise
-        || unit.starts_with("group")
-            // conv 3D
-            || unit == "lazy_im2col_big"
-            || unit == "lazy_im2col_big_2"
-            || unit == "batch_3d"
-            || unit == "bias_3d_1"
-            // kernel with non 0 zero_point
-            || unit == "kernel_zp"
+}
+
+fn compatible_conv_f32(qcp: &ConvProblem) -> bool {
+    qcp.group == 1 && qcp.kernel.ndim() == 4
+}
+
+fn compatible_conv_q(qcp: &QConvProblem) -> bool {
+    if qcp.group != 1 {
+        return false;
+    }
+    let idt = qcp.data.datum_type();
+    let kdt = qcp.kernel.datum_type();
+    // all u8 and per-layer
+    if idt.unquantized() == u8::datum_type()
+        && kdt.unquantized() == u8::datum_type()
+        && qcp.qp.iter().all(|qp| qp.is_uniform())
+    {
+        return true;
+    }
+    // all i8 and no zero_point
+    if idt.unquantized() == i8::datum_type()
+        && kdt.unquantized() == i8::datum_type()
+        && qcp.qp[0].is_zero().unwrap()
+        && qcp.qp[2].is_zero().unwrap()
+        && qcp.qp[4].is_zero().unwrap()
+    {
+        return true;
+    }
+    false
 }

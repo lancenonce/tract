@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use half::f16;
 use ndarray::{Data, Dimension, RawData};
 use tract_extra::WithTractExtra;
 use tract_libcli::annotations::Annotations;
@@ -239,8 +240,21 @@ impl ModelInterface for Model {
         Ok(())
     }
 
-    fn half(&mut self) -> Result<()> {
-        self.0 = tract_nnef::tract_core::half::HalfTranslator.translate_model(&self.0)?;
+    fn f32_to_f16(&mut self) -> Result<()> {
+        self.0 = tract_nnef::tract_core::floats::FloatPrecisionTranslator::<
+            f32,
+            f16,
+        >::default()
+        .translate_model(&self.0)?;
+        Ok(())
+    }
+    
+    fn f16_to_f32(&mut self) -> Result<()> {
+        self.0 = tract_nnef::tract_core::floats::FloatPrecisionTranslator::<
+            f16,
+            f32,
+        >::default()
+        .translate_model(&self.0)?;
         Ok(())
     }
 

@@ -47,7 +47,7 @@ fn de_fully_connected(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
     ensure!(!options.keep_num_dims());
     ensure!(!options.asymmetric_quantize_inputs());
     let mut inputs: TVec<OutletId> = op.inputs.into();
-    let qp = super::linearops_quantization_suport(op, &input, &mut inputs, false)?;
+    let qp = super::linearops_quantization_suport(op, &input, &mut inputs)?;
     let operating_dt =
         if input.datum_type.is_float() { input.datum_type } else { i32::datum_type() };
     let einsum = EinSum { axes: "BI,OI,O,,,,,,->BO".parse()?, q_params: qp, operating_dt };
@@ -124,7 +124,7 @@ pub fn de_relu(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
         op.ctx.target.outlet_fact(input)?.datum_type,
     )?;
     wire_with_rank_broadcast(
-        &format!("{}.relu", op.prefix),
+        format!("{}.relu", op.prefix),
         op.ctx.target,
         core::math::max(),
         &wires,
@@ -141,7 +141,7 @@ pub fn de_relu6(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
         op.ctx.target.outlet_fact(input)?.datum_type,
     )?;
     wire_with_rank_broadcast(
-        &format!("{}.relu6", op.prefix),
+        format!("{}.relu6", op.prefix),
         op.ctx.target,
         core::math::min(),
         &wires,

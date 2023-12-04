@@ -63,7 +63,6 @@ fn linearops_quantization_suport(
     op: &mut DeserOp,
     input: &TypedFact,
     inputs: &mut TVec<OutletId>,
-    kscale_is_per_axis: bool,
 ) -> TractResult<Option<DatumType>> {
     if op.output_facts[0].datum_type.is_quantized() {
         let p = &op.prefix;
@@ -72,18 +71,22 @@ fn linearops_quantization_suport(
         let k_input = op.flat.inputs().unwrap().get(1);
         let k_tensor = op.ctx.subgraph.tensors().unwrap().get(k_input as usize);
         let k_qp = k_tensor.quantization().unwrap();
-        let k_scale = if kscale_is_per_axis {
+        let k_scale = if k_qp.scale().unwrap().len() > 1 {
             rctensor1(&k_qp.scale().unwrap().iter().collect_vec())
         } else {
             rctensor0(k_qp.scale().unwrap().get(0))
         };
         let k_zp = k_qp.zero_point().unwrap().iter().map(|i| i as i32).collect_vec();
-        ensure!(k_zp.iter().all(|x| *x == 0));
-        inputs.push(op.ctx.target.add_const(format!("{p}.k0"), rctensor0(0i8))?);
+        let k_zp = if k_zp.iter().all_equal() {
+            tensor0(k_zp[0])
+        } else {
+            tensor1(&k_zp)
+        };
+        inputs.push(op.ctx.target.add_const(format!("{p}.k0"), k_zp.into_arc_tensor())?);
         inputs.push(op.ctx.target.add_const(format!("{p}.kscale"), k_scale)?);
-        inputs.push(op.ctx.target.add_const(format!("{p}.i0"), rctensor0(iqp.zp_scale().0 as i8))?);
+        inputs.push(op.ctx.target.add_const(format!("{p}.i0"), rctensor0(iqp.zp_scale().0))?);
         inputs.push(op.ctx.target.add_const(format!("{p}.iscale"), rctensor0(iqp.zp_scale().1))?);
-        inputs.push(op.ctx.target.add_const(format!("{p}.c0"), rctensor0(oqp.zp_scale().0 as i8))?);
+        inputs.push(op.ctx.target.add_const(format!("{p}.c0"), rctensor0(oqp.zp_scale().0))?);
         inputs.push(op.ctx.target.add_const(format!("{p}.cscale"), rctensor0(oqp.zp_scale().1))?);
         Ok(Some(oqp))
     } else {
@@ -91,7 +94,12 @@ fn linearops_quantization_suport(
     }
 }
 
-fn ser_iff(builder: &mut SubgraphBuilder, model: &TypedModel, node: &TypedNode, _op: &Iff) -> TractResult<()> {
+fn ser_iff(
+    builder: &mut SubgraphBuilder,
+    model: &TypedModel,
+    node: &TypedNode,
+    _op: &Iff,
+) -> TractResult<()> {
     let inputs = builder.map_outlets(model, &node.inputs)?;
     let outputs = builder.map_outlets(model, [OutletId::new(node.id, 0)])?;
     builder.write_op(&inputs, &outputs, 123, 1, BuiltinOperator::SELECT_V2)
